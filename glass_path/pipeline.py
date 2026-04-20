@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from .data import SampleRecord
-from .concept import ConceptBottleneckConfig
+from .concept import ConceptBottleneckConfig, MultimodalConceptBottleneckConfig
 from .data import GlassDataset
 from .federated import split_by_patient
 
@@ -82,6 +82,16 @@ class UnifiedGlassPipeline:
             hidden_dim=self.config.hidden_dim,
         )
 
+    def multimodal_concept_config(self) -> MultimodalConceptBottleneckConfig:
+        return MultimodalConceptBottleneckConfig(
+            ssl_dim=self.config.ssl_embedding_dim,
+            graph_dim=self.config.graph_embedding_dim,
+            fusion_dim=self.config.hidden_dim,
+            concept_dim=self.config.concept_dim,
+            num_classes=self.config.num_classes,
+            hidden_dim=self.config.hidden_dim,
+        )
+
     def train_ssl(self):
         from .ssl import FederatedSSLTrainer
 
@@ -134,5 +144,17 @@ class UnifiedGlassPipeline:
             concept_targets=concept_targets,
             class_targets=class_targets,
             config=self.concept_config(),
+            device=self.config.device,
+        )
+
+    def train_multimodal_concept(self, ssl_features, graph_features, concept_targets, class_targets):
+        from .concept import train_multimodal_concept_bottleneck
+
+        return train_multimodal_concept_bottleneck(
+            ssl_features=ssl_features,
+            graph_features=graph_features,
+            concept_targets=concept_targets,
+            class_targets=class_targets,
+            config=self.multimodal_concept_config(),
             device=self.config.device,
         )

@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+import os
 import numpy as np
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 try:
     import torch
@@ -111,20 +114,73 @@ class GraphSAGELayer(nn.Module if nn is not None else object):
         return self.norm(torch.relu(out))
 
 
-class GraphEncoder(nn.Module if nn is not None else object):
-    def __init__(self, in_dim: int, hidden_dim: int = 128, embedding_dim: int = 128):
+class GraphAttentionLayer(nn.Module if nn is not None else object):
+    def __init__(self, in_dim: int, out_dim: int, heads: int = 1, dropout: float = 0.0):
         require_torch()
         super().__init__()
+        self.heads = heads
+        self.out_dim = out_dim
+        self.proj = nn.Linear(in_dim, out_dim * heads, bias=False)
+        self.attn_src = nn.Parameter(torch.empty(heads, out_dim))
+        self.attn_dst = nn.Parameter(torch.empty(heads, out_dim))
+        self.bias = nn.Parameter(torch.zeros(out_dim * heads))
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(out_dim * heads)
+        self.leaky_relu = nn.LeakyReLU(0.2)
+        nn.init.xavier_uniform_(self.attn_src)
+        nn.init.xavier_uniform_(self.attn_dst)
+
+    def forward(self, x, edge_index):
+        if edge_index.numel() == 0:
+            out = self.proj(x)
+            return self.norm(torch.relu(out + self.bias))
+
+        num_nodes = x.size(0)
+        h = self.proj(x).view(num_nodes, self.heads, self.out_dim)
+        src, dst = edge_index
+        out = torch.zeros_like(h)
+        for node in range(num_nodes):
+            mask = dst == node
+            if not torch.any(mask):
+                out[node] = h[node]
+                continue
+            node_src = src[mask]
+            node_dst = dst[mask]
+            h_src = h[node_src]
+            h_dst = h[node_dst]
+            scores = (h_src * self.attn_src).sum(dim=-1) + (h_dst * self.attn_dst).sum(dim=-1)
+            scores = self.leaky_relu(scores)
+            weights = torch.softmax(scores, dim=0)
+            weights = self.dropout(weights)
+            neigh = (weights.unsqueeze(-1) * h_src).sum(dim=0)
+            out[node] = neigh
+        out = out.reshape(num_nodes, self.heads * self.out_dim) + self.bias
+        return self.norm(torch.relu(out))
+
+
+class GraphEncoder(nn.Module if nn is not None else object):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 128,
+        embedding_dim: int = 128,
+        heads: int = 2,
+    ):
+        require_torch()
+        attn_dim = max(1, hidden_dim // heads)
+        message_dim = attn_dim * heads
+        super().__init__()
+        self.hidden_dim = message_dim
         self.layers = nn.ModuleList(
             [
-                GraphSAGELayer(in_dim, hidden_dim),
-                GraphSAGELayer(hidden_dim, hidden_dim),
+                GraphAttentionLayer(in_dim, attn_dim, heads=heads),
+                GraphAttentionLayer(message_dim, attn_dim, heads=heads),
             ]
         )
         self.readout = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(message_dim * 2, message_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(message_dim, embedding_dim),
         )
 
     def forward(self, x, edge_index, batch=None):
@@ -137,10 +193,19 @@ class GraphEncoder(nn.Module if nn is not None else object):
 
 
 class GraphClassifier(nn.Module if nn is not None else object):
-    def __init__(self, in_dim: int, hidden_dim: int, embedding_dim: int, num_classes: int):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        embedding_dim: int,
+        num_classes: int,
+        heads: int = 2,
+    ):
         require_torch()
         super().__init__()
-        self.encoder = GraphEncoder(in_dim, hidden_dim=hidden_dim, embedding_dim=embedding_dim)
+        self.encoder = GraphEncoder(
+            in_dim, hidden_dim=hidden_dim, embedding_dim=embedding_dim, heads=heads
+        )
         self.head = nn.Linear(embedding_dim, num_classes)
 
     def forward(self, x, edge_index, batch=None):
@@ -177,6 +242,7 @@ def train_graph_classifier(
     num_classes: int,
     hidden_dim: int = 128,
     embedding_dim: int = 128,
+    heads: int = 2,
     epochs: int = 10,
     lr: float = 1e-3,
     device: str = "cpu",
@@ -195,6 +261,7 @@ def train_graph_classifier(
         hidden_dim=hidden_dim,
         embedding_dim=embedding_dim,
         num_classes=num_classes,
+        heads=heads,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()

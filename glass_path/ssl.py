@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+import os
 import numpy as np
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 try:
     import torch
@@ -59,33 +62,81 @@ class SSLImageDataset(Dataset):
         return view1, view2
 
 
-class PathologyBackbone(nn.Module if nn is not None else object):
-    def __init__(self, embedding_dim: int = 256):
+class TransformerBlock(nn.Module if nn is not None else object):
+    def __init__(self, dim: int, num_heads: int = 4, mlp_ratio: int = 4, dropout: float = 0.0):
         require_torch()
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.projector = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, embedding_dim),
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads=num_heads, batch_first=True, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * mlp_ratio),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * mlp_ratio, dim),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.projector(x)
-        return torch.nn.functional.normalize(x, dim=-1)
+        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
+
+
+class PathologyBackbone(nn.Module if nn is not None else object):
+    def __init__(
+        self,
+        embedding_dim: int = 256,
+        patch_size: int = 16,
+        hidden_dim: int = 192,
+        depth: int = 2,
+        num_heads: int = 4,
+        max_patches: int = 196,
+    ):
+        require_torch()
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+        self.max_patches = max_patches
+        self.patch_embed = nn.Conv2d(3, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_patches + 1, hidden_dim))
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(hidden_dim, num_heads=num_heads) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.projector = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embedding_dim),
+        )
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        tokens, embedding = self.forward_features(x)
+        return embedding
+
+    def forward_features(self, x):
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+        batch_size, num_patches, _ = x.shape
+        if num_patches > self.max_patches:
+            x = x[:, : self.max_patches, :]
+            num_patches = self.max_patches
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
+        x = x + self.pos_embed[:, : num_patches + 1, :]
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        tokens = x
+        cls = x[:, 0]
+        embedding = self.projector(cls)
+        embedding = torch.nn.functional.normalize(embedding, dim=-1)
+        return tokens, embedding
 
 
 class PredictiveHead(nn.Module if nn is not None else object):
