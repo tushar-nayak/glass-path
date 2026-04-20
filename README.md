@@ -1,4 +1,4 @@
-# G.L.A.S.S. Pathology
+# GLASS (Graph-based Learning Architecture for Spatial Structures) in Pathology
 
 Unified federated pipeline for self-supervised image encoding, local graph reasoning, and concept-bottleneck classification.
 
@@ -32,6 +32,12 @@ python -m code.cli train --csv data/data.csv --image-root /path/to/images
 ```
 
 On macOS, the training command defaults to `--device auto`, which picks MPS when available.
+
+For this repository, the image root is `data/images` by default, and the label is encoded by the subfolder name, for example `data/images/aca_bd/` or `data/images/scc_pd/`.
+
+The `train` command now does two stages by default:
+- federated SSL pretraining
+- supervised classification on `aca`, `nor`, and `scc`
 
 The repository currently contains metadata and the paper PDF, but no raw image files. The code is written to resolve image paths from an external image root when you add the image assets later.
 

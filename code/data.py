@@ -23,6 +23,10 @@ class SampleRecord:
     def label(self) -> str:
         return self.superclass
 
+    @property
+    def folder_label(self) -> str:
+        return self.superclass if not self.subclass else f"{self.superclass}_{self.subclass}"
+
 
 class GlassDataset:
     """CSV-backed dataset with patient-level federated partitioning."""
@@ -92,15 +96,15 @@ class GlassDataset:
         """Attach image paths using a list of filename templates."""
         root = Path(image_root)
         patterns = patterns or [
-            "{patient_id}/{image_id}_{resolution}.jpg",
-            "{patient_id}/{image_id}_{resolution}.jpeg",
-            "{patient_id}/{image_id}_{resolution}.png",
-            "{patient_id}/{image_id}.jpg",
-            "{patient_id}/{image_id}.jpeg",
-            "{patient_id}/{image_id}.png",
-            "{resolution}/{patient_id}_{image_id}.jpg",
-            "{image_id}_{resolution}.jpg",
-            "{image_id}.jpg",
+            "{folder_label}/{folder_label}_{resolution}_{image_id}.jpg",
+            "{folder_label}/{folder_label}_{resolution}_{image_id}.jpeg",
+            "{folder_label}/{folder_label}_{resolution}_{image_id}.png",
+            "{folder_label}/{folder_label}_{image_id}_{resolution}.jpg",
+            "{folder_label}/{folder_label}_{image_id}.jpg",
+            "{folder_label}/{folder_label}_{resolution}.jpg",
+            "{superclass}/{superclass}_{resolution}_{image_id}.jpg",
+            "{superclass}/{superclass}_{image_id}_{resolution}.jpg",
+            "{superclass}/{superclass}_{image_id}.jpg",
         ]
         resolved = self.frame.copy()
         paths: list[str | None] = []
@@ -110,6 +114,7 @@ class GlassDataset:
                 rel = pattern.format(
                     superclass=row.superclass,
                     subclass=row.subclass,
+                    folder_label=row.superclass if not str(row.subclass) else f"{row.superclass}_{row.subclass}",
                     resolution=row.resolution,
                     image_id=row.image_id,
                     patient_id=row.patient_id,
