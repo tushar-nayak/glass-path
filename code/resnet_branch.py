@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+import pandas as pd
 
 try:
     import torch
@@ -96,6 +97,70 @@ class ResNetBranchConfig:
 
 def _flatten_records(nested_records: Iterable[list]) -> list[SampleRecord]:
     return [record for records in nested_records for record in records]
+
+
+def records_by_patient_from_frame(frame: pd.DataFrame) -> list[list[SampleRecord]]:
+    grouped: list[list[SampleRecord]] = []
+    for _, group in frame.groupby("patient_id", sort=True):
+        records = [
+            SampleRecord(
+                superclass=str(r.superclass),
+                subclass=str(r.subclass),
+                resolution=str(r.resolution),
+                image_id=str(r.image_id),
+                patient_id=str(r.patient_id),
+                image_path=str(getattr(r, "image_path", None))
+                if getattr(r, "image_path", None) is not None
+                and str(getattr(r, "image_path", None))
+                and str(getattr(r, "image_path", None)) != "nan"
+                else None,
+            )
+            for r in group.itertuples(index=False)
+            if getattr(r, "image_path", None) is not None
+            and str(getattr(r, "image_path", None))
+            and str(getattr(r, "image_path", None)) != "nan"
+        ]
+        if records:
+            grouped.append(records)
+    return grouped
+
+
+def patient_split_frames(
+    frame: pd.DataFrame,
+    val_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    seed: int = 42,
+) -> dict[str, pd.DataFrame]:
+    frame = frame.copy()
+    if frame.empty:
+        return {"train": frame.copy(), "val": frame.copy(), "test": frame.copy()}
+    patient_labels = []
+    for patient_id, group in frame.groupby("patient_id", sort=True):
+        label = group["superclass"].mode().iloc[0]
+        patient_labels.append((str(patient_id), str(label)))
+    by_label: dict[str, list[str]] = {}
+    for patient_id, label in patient_labels:
+        by_label.setdefault(label, []).append(patient_id)
+    rng = np.random.default_rng(seed)
+    train_ids: list[str] = []
+    val_ids: list[str] = []
+    test_ids: list[str] = []
+    for _, patient_ids in sorted(by_label.items()):
+        ids = list(patient_ids)
+        rng.shuffle(ids)
+        n = len(ids)
+        n_test = max(1, int(round(n * test_fraction))) if n >= 3 else max(0, int(round(n * test_fraction)))
+        n_val = max(1, int(round(n * val_fraction))) if n >= 3 else max(0, int(round(n * val_fraction)))
+        if n_test + n_val >= n:
+            n_test = 1 if n >= 2 else 0
+            n_val = 1 if n >= 3 else 0
+        test_ids.extend(ids[:n_test])
+        val_ids.extend(ids[n_test : n_test + n_val])
+        train_ids.extend(ids[n_test + n_val :])
+    train_df = frame[frame["patient_id"].astype(str).isin(train_ids)].copy()
+    val_df = frame[frame["patient_id"].astype(str).isin(val_ids)].copy()
+    test_df = frame[frame["patient_id"].astype(str).isin(test_ids)].copy()
+    return {"train": train_df, "val": val_df, "test": test_df}
 
 
 def _make_loader(records, label_to_index: dict[str, int], image_size: int, augment: bool) -> DataLoader:

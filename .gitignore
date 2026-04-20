@@ -11,3 +11,4 @@ build/
 *.pt
 *.pth
 checkpoints/
+checkpoints_resnet/

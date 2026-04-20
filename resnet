@@ -12,7 +12,7 @@ if [[ "${1:-}" != "" && "${1:-}" != -* ]]; then
   shift
 fi
 
-python -m code.cli train \
+python -m code.cli resnet \
   --csv data/data.csv \
   --image-root "${IMAGE_ROOT}" \
   --device auto \
