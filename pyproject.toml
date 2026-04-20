@@ -16,8 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-glass-path = "glass_path.cli:main"
+glass-path = "code.cli:main"
 
 [tool.setuptools]
-packages = ["glass_path"]
-
+packages = ["code"]

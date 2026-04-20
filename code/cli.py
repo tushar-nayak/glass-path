@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .pipeline import PipelineConfig, UnifiedGlassPipeline
+from .runtime import resolve_device
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--graph-dim", type=int, default=128)
     train.add_argument("--concept-dim", type=int, default=8)
     train.add_argument("--num-classes", type=int, default=3)
-    train.add_argument("--device", default="cpu")
+    train.add_argument("--device", default="auto", help="auto, mps, cuda, or cpu")
 
     return parser
 
@@ -43,7 +44,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             graph_embedding_dim=args.graph_dim,
             concept_dim=args.concept_dim,
             num_classes=args.num_classes,
-            device=args.device,
+            device=resolve_device(args.device),
         )
     )
     resolved = pipeline.resolved_frame()
@@ -53,6 +54,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             "rows": len(resolved),
             "image_paths_resolved": int(with_paths),
             "clients": len(resolved.groupby("patient_id", sort=True)),
+            "device": pipeline.config.device,
             "ssl_config": pipeline.ssl_config(),
             "concept_config": pipeline.concept_config(),
         }

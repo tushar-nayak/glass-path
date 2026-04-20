@@ -22,14 +22,16 @@ conda activate bme_ml
 Inspect the dataset:
 
 ```bash
-python -m glass_path.cli inspect --csv data/data.csv
+python -m code.cli inspect --csv data/data.csv
 ```
 
 Prepare the training pipeline:
 
 ```bash
-python -m glass_path.cli train --csv data/data.csv --image-root /path/to/images
+python -m code.cli train --csv data/data.csv --image-root /path/to/images
 ```
+
+On macOS, the training command defaults to `--device auto`, which picks MPS when available.
 
 The repository currently contains metadata and the paper PDF, but no raw image files. The code is written to resolve image paths from an external image root when you add the image assets later.
 

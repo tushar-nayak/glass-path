@@ -9,6 +9,7 @@ from .data import SampleRecord
 from .concept import ConceptBottleneckConfig, MultimodalConceptBottleneckConfig
 from .data import GlassDataset
 from .federated import split_by_patient
+from .runtime import resolve_device
 
 
 @dataclass
@@ -22,7 +23,7 @@ class PipelineConfig:
     concept_dim: int = 8
     hidden_dim: int = 128
     num_classes: int = 3
-    device: str = "cpu"
+    device: str = "auto"
 
 
 class UnifiedGlassPipeline:
@@ -71,7 +72,7 @@ class UnifiedGlassPipeline:
         return FederatedSSLConfig(
             image_size=self.config.image_size,
             embedding_dim=self.config.ssl_embedding_dim,
-            device=self.config.device,
+            device=resolve_device(self.config.device),
         )
 
     def concept_config(self) -> ConceptBottleneckConfig:
@@ -109,7 +110,7 @@ class UnifiedGlassPipeline:
             num_classes=self.config.num_classes,
             hidden_dim=self.config.hidden_dim,
             embedding_dim=self.config.graph_embedding_dim,
-            device=self.config.device,
+            device=resolve_device(self.config.device),
         )
 
     def graph_inputs_from_images(self, graph_builder, image_feature_extractor):
@@ -144,7 +145,7 @@ class UnifiedGlassPipeline:
             concept_targets=concept_targets,
             class_targets=class_targets,
             config=self.concept_config(),
-            device=self.config.device,
+            device=resolve_device(self.config.device),
         )
 
     def train_multimodal_concept(self, ssl_features, graph_features, concept_targets, class_targets):
@@ -156,5 +157,5 @@ class UnifiedGlassPipeline:
             concept_targets=concept_targets,
             class_targets=class_targets,
             config=self.multimodal_concept_config(),
-            device=self.config.device,
+            device=resolve_device(self.config.device),
         )
