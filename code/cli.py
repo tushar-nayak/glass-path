@@ -6,7 +6,8 @@ from pathlib import Path
 
 from .pipeline import PipelineConfig, UnifiedGlassPipeline
 from .runtime import resolve_device
-from .classifier import evaluate_classifier, save_checkpoint
+from .classifier import save_checkpoint
+from .resnet_branch import ResNetBranchConfig, train_resnet_branch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,6 +31,19 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--val-fraction", type=float, default=0.15)
     train.add_argument("--test-fraction", type=float, default=0.15)
     train.add_argument("--seed", type=int, default=42)
+
+    resnet = subparsers.add_parser("resnet", help="Train a simple ResNet-50 classifier")
+    resnet.add_argument("--csv", required=True, help="Path to data.csv")
+    resnet.add_argument("--image-root", default="data/images", help="Directory containing images")
+    resnet.add_argument("--image-size", type=int, default=224)
+    resnet.add_argument("--batch-size", type=int, default=16)
+    resnet.add_argument("--epochs", type=int, default=8)
+    resnet.add_argument("--lr", type=float, default=1e-4)
+    resnet.add_argument("--device", default="auto", help="auto, mps, cuda, or cpu")
+    resnet.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights")
+    resnet.add_argument("--freeze-backbone", action="store_true", help="Freeze all layers except fc")
+    resnet.add_argument("--patience", type=int, default=2)
+    resnet.add_argument("--save-dir", default="checkpoints_resnet", help="Directory for model checkpoints")
 
     return parser
 
@@ -91,29 +105,12 @@ def cmd_train(args: argparse.Namespace) -> int:
         return 1
     try:
         ssl_model = pipeline.train_ssl_from_frame(train_frame, quick=args.quick)
-        classifier_model = pipeline.train_classifier_from_frame(
+        classifier_model, classifier_summary = pipeline.train_classifier_with_splits(
             train_frame,
+            val_frame,
+            test_frame,
             ssl_model,
             quick=args.quick,
-        )
-        label_map = pipeline.label_map()
-        val_records = [record for records in pipeline.client_records_from_frame(val_frame) for record in records]
-        test_records = [record for records in pipeline.client_records_from_frame(test_frame) for record in records]
-        val_metrics = evaluate_classifier(
-            classifier_model,
-            val_records,
-            label_map,
-            image_size=classifier_cfg.image_size,
-            batch_size=classifier_cfg.batch_size,
-            device=classifier_cfg.device,
-        )
-        test_metrics = evaluate_classifier(
-            classifier_model,
-            test_records,
-            label_map,
-            image_size=classifier_cfg.image_size,
-            batch_size=classifier_cfg.batch_size,
-            device=classifier_cfg.device,
         )
     except ModuleNotFoundError as exc:
         print(str(exc))
@@ -141,15 +138,67 @@ def cmd_train(args: argparse.Namespace) -> int:
         },
     )
     metrics_payload = {
-        "val": val_metrics.__dict__,
-        "test": test_metrics.__dict__,
+        "best_round": classifier_summary["best_round"],
+        "val": classifier_summary["val"].__dict__,
+        "test": classifier_summary["test"].__dict__,
     }
     (save_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
     print({"ssl_model": type(ssl_model).__name__, "classifier_model": type(classifier_model).__name__})
     print(metrics_payload)
     print(
         "Federated SSL pretraining completed, then the supervised classifier was trained on "
-        "image-level labels for aca, scc, and nor."
+        "image-level labels for aca, scc, and nor with backbone fine-tuning and early stopping."
+    )
+    return 0
+
+
+def cmd_resnet(args: argparse.Namespace) -> int:
+    pipeline = UnifiedGlassPipeline(
+        PipelineConfig(
+            csv_path=Path(args.csv),
+            image_root=Path(args.image_root),
+            image_size=args.image_size,
+            device=resolve_device(args.device),
+        )
+    )
+    resolved = pipeline.resolved_frame()
+    splits = pipeline.patient_split_frames(
+        resolved,
+        val_fraction=0.15,
+        test_fraction=0.15,
+        seed=42,
+    )
+    label_map = pipeline.label_map()
+    config = ResNetBranchConfig(
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        device=resolve_device(args.device),
+        pretrained=args.pretrained,
+        freeze_backbone=args.freeze_backbone,
+        patience=args.patience,
+    )
+    model, metrics = train_resnet_branch(
+        pipeline.client_records_from_frame(splits["train"]),
+        pipeline.client_records_from_frame(splits["val"]),
+        pipeline.client_records_from_frame(splits["test"]),
+        label_map,
+        config,
+        save_dir=args.save_dir,
+    )
+    print(
+        {
+            "model": type(model).__name__,
+            "device": config.device,
+            "label_map": label_map,
+            "metrics": {
+                "best_round": metrics["best_round"],
+                "val": metrics["val"].__dict__,
+                "test": metrics["test"].__dict__,
+            },
+            "save_dir": metrics["save_dir"],
+        }
     )
     return 0
 
@@ -161,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_inspect(args)
     if args.command == "train":
         return cmd_train(args)
+    if args.command == "resnet":
+        return cmd_resnet(args)
     raise ValueError(f"Unknown command: {args.command}")
 
 

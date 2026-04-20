@@ -39,6 +39,14 @@ The `train` command now does two stages by default:
 - federated SSL pretraining
 - supervised classification on `aca`, `nor`, and `scc`
 
+There is also a separate baseline branch:
+
+```bash
+python -m code.cli resnet --csv data/data.csv --image-root data/images --epochs 2
+```
+
+That branch trains a plain ResNet-50 classifier and writes its checkpoint to `checkpoints_resnet/`.
+
 The repository currently contains metadata and the paper PDF, but no raw image files. The code is written to resolve image paths from an external image root when you add the image assets later.
 
 If you need to install the package into the environment anyway, run `pip install -e .` after activating `bme_ml`.

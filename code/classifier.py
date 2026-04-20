@@ -98,16 +98,23 @@ class PathologyClassifier(nn.Module if nn is not None else object):
         features = self.backbone(x)
         return self.head(features)
 
+    def set_backbone_trainable(self, trainable: bool) -> None:
+        for param in self.backbone.parameters():
+            param.requires_grad = trainable
+
 
 @dataclass
 class FederatedClassifierConfig:
     image_size: int = 224
     batch_size: int = 16
     local_epochs: int = 1
-    rounds: int = 2
+    rounds: int = 6
     lr: float = 1e-3
     device: str = "cpu"
     freeze_backbone: bool = True
+    head_warmup_rounds: int = 1
+    patience: int = 2
+    min_delta: float = 1e-4
 
 
 def _confusion_matrix(y_true: list[int], y_pred: list[int], num_classes: int) -> list[list[int]]:
@@ -198,6 +205,15 @@ class FederatedClassifierTrainer:
         self.config = config
         self.label_to_index = label_to_index
 
+    def _build_model(self, backbone: PathologyBackbone, train_backbone: bool) -> PathologyClassifier:
+        model = PathologyClassifier(
+            copy.deepcopy(backbone),
+            num_classes=len(self.label_to_index),
+            freeze_backbone=not train_backbone,
+        )
+        model.set_backbone_trainable(train_backbone)
+        return model
+
     def _make_loader(self, records) -> DataLoader:
         dataset = SupervisedImageDataset(
             records,
@@ -229,30 +245,116 @@ class FederatedClassifierTrainer:
                 optimizer.step()
         return model.state_dict()
 
-    def fit(self, patient_records: Iterable[list], backbone: PathologyBackbone) -> PathologyClassifier:
+    def fit_rounds(
+        self,
+        patient_records: Iterable[list],
+        backbone: PathologyBackbone,
+        rounds: int | None = None,
+        train_backbone: bool = False,
+    ) -> PathologyClassifier:
         loaders = [self._make_loader(records) for records in patient_records if len(records) > 0]
         if not loaders:
             raise ValueError("No labeled images were found. Resolve paths before training.")
-        global_model = PathologyClassifier(
-            copy.deepcopy(backbone),
-            num_classes=len(self.label_to_index),
-            freeze_backbone=self.config.freeze_backbone,
-        ).to(self.config.device)
-        for _ in range(self.config.rounds):
+        total_rounds = self.config.rounds if rounds is None else rounds
+        global_model = self._build_model(backbone, train_backbone=train_backbone).to(self.config.device)
+        for _ in range(total_rounds):
             local_states = []
             weights = []
             for loader in loaders:
-                local_model = PathologyClassifier(
-                    copy.deepcopy(backbone),
-                    num_classes=len(self.label_to_index),
-                    freeze_backbone=self.config.freeze_backbone,
-                ).to(self.config.device)
+                local_model = self._build_model(backbone, train_backbone=train_backbone).to(
+                    self.config.device
+                )
                 local_model.load_state_dict(global_model.state_dict())
+                local_model.set_backbone_trainable(train_backbone)
                 state = self._train_local(local_model, loader)
                 local_states.append(state)
                 weights.append(float(len(loader.dataset)))
             global_model.load_state_dict(weighted_average_state_dicts(local_states, weights))
         return global_model.cpu()
+
+    def _flatten_records(self, nested_records: Iterable[list]) -> list:
+        return [record for records in nested_records for record in records]
+
+    def train_with_early_stopping(
+        self,
+        train_records: Iterable[list],
+        val_records: Iterable[list],
+        backbone: PathologyBackbone,
+    ) -> tuple[PathologyClassifier, dict]:
+        train_loaders = [self._make_loader(records) for records in train_records if len(records) > 0]
+        if not train_loaders:
+            raise ValueError("No labeled images were found. Resolve paths before training.")
+
+        val_flat = self._flatten_records(val_records)
+        best_model = None
+        best_metrics = None
+        best_score = float("-inf")
+        best_round = -1
+        stale_rounds = 0
+
+        global_model = self._build_model(backbone, train_backbone=False).to(self.config.device)
+        max_rounds = self.config.rounds
+
+        for round_idx in range(max_rounds):
+            train_backbone = round_idx >= self.config.head_warmup_rounds and not self.config.freeze_backbone
+            local_states = []
+            weights = []
+            for loader in train_loaders:
+                local_model = self._build_model(backbone, train_backbone=train_backbone).to(
+                    self.config.device
+                )
+                local_model.load_state_dict(global_model.state_dict())
+                local_model.set_backbone_trainable(train_backbone)
+                state = self._train_local(local_model, loader)
+                local_states.append(state)
+                weights.append(float(len(loader.dataset)))
+            global_model.load_state_dict(weighted_average_state_dicts(local_states, weights))
+
+            val_metrics = evaluate_classifier(
+                global_model.cpu(),
+                val_flat,
+                self.label_to_index,
+                image_size=self.config.image_size,
+                batch_size=self.config.batch_size,
+                device="cpu",
+            )
+            score = val_metrics.macro_f1
+            if score > best_score + self.config.min_delta:
+                best_score = score
+                best_model = copy.deepcopy(global_model.cpu())
+                best_metrics = val_metrics
+                best_round = round_idx
+                stale_rounds = 0
+            else:
+                stale_rounds += 1
+
+            if stale_rounds >= self.config.patience:
+                break
+
+        if best_model is None:
+            best_model = global_model.cpu()
+            best_metrics = evaluate_classifier(
+                best_model,
+                val_flat,
+                self.label_to_index,
+                image_size=self.config.image_size,
+                batch_size=self.config.batch_size,
+                device="cpu",
+            )
+            best_round = max_rounds - 1
+
+        return best_model, {
+            "best_round": best_round,
+            "val": best_metrics,
+        }
+
+    def fit(self, patient_records: Iterable[list], backbone: PathologyBackbone) -> PathologyClassifier:
+        return self.fit_rounds(
+            patient_records,
+            backbone,
+            rounds=self.config.rounds,
+            train_backbone=not self.config.freeze_backbone,
+        )
 
     def train_and_evaluate(
         self,
@@ -261,27 +363,19 @@ class FederatedClassifierTrainer:
         test_records: Iterable[list],
         backbone: PathologyBackbone,
     ) -> tuple[PathologyClassifier, dict]:
-        model = self.fit(train_records, backbone)
-        val_flat = [record for records in val_records for record in records]
-        test_flat = [record for records in test_records for record in records]
-        val_metrics = evaluate_classifier(
-            model,
-            val_flat,
-            self.label_to_index,
-            image_size=self.config.image_size,
-            batch_size=self.config.batch_size,
-            device=self.config.device,
-        )
+        model, summary = self.train_with_early_stopping(train_records, val_records, backbone)
+        test_flat = self._flatten_records(test_records)
         test_metrics = evaluate_classifier(
-            model,
+            model.cpu(),
             test_flat,
             self.label_to_index,
             image_size=self.config.image_size,
             batch_size=self.config.batch_size,
-            device=self.config.device,
+            device="cpu",
         )
         return model, {
-            "val": val_metrics,
+            "best_round": summary["best_round"],
+            "val": summary["val"],
             "test": test_metrics,
         }
 

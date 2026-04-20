@@ -154,13 +154,15 @@ class UnifiedGlassPipeline:
         return FederatedClassifierConfig(
             image_size=self.config.image_size,
             device=resolve_device(self.config.device),
+            freeze_backbone=False,
         )
 
     def quick_classifier_config(self) -> FederatedClassifierConfig:
         config = self.classifier_config()
         config.local_epochs = 1
-        config.rounds = 1
+        config.rounds = 3
         config.batch_size = min(config.batch_size, 8)
+        config.patience = 1
         return config
 
     def label_map(self) -> dict[str, int]:
@@ -204,6 +206,25 @@ class UnifiedGlassPipeline:
         )
         client_records = self.client_records_from_frame(frame)
         return trainer.fit(client_records, backbone)
+
+    def train_classifier_with_splits(
+        self,
+        train_frame: pd.DataFrame,
+        val_frame: pd.DataFrame,
+        test_frame: pd.DataFrame,
+        backbone,
+        quick: bool = False,
+    ):
+        from .classifier import FederatedClassifierTrainer
+
+        trainer = FederatedClassifierTrainer(
+            self.quick_classifier_config() if quick else self.classifier_config(),
+            self.label_map(),
+        )
+        train_records = self.client_records_from_frame(train_frame)
+        val_records = self.client_records_from_frame(val_frame)
+        test_records = self.client_records_from_frame(test_frame)
+        return trainer.train_and_evaluate(train_records, val_records, test_records, backbone)
 
     def train_graph(self, graphs, labels, input_dim: int):
         from .graph import train_graph_classifier
