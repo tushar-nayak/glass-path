@@ -12,3 +12,5 @@ build/
 *.pth
 checkpoints/
 train_cpu_*.log
+runs/
+checkpoints_*/
