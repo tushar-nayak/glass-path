@@ -31,6 +31,24 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--val-fraction", type=float, default=0.15)
     train.add_argument("--test-fraction", type=float, default=0.15)
     train.add_argument("--seed", type=int, default=42)
+    train.add_argument(
+        "--max-patients",
+        type=int,
+        default=0,
+        help="If set, only use the first N patients (sorted by patient_id) to reduce runtime.",
+    )
+    train.add_argument(
+        "--max-images-per-patient",
+        type=int,
+        default=0,
+        help="If set, cap the number of images used per patient to reduce runtime.",
+    )
+    train.add_argument(
+        "--num-threads",
+        type=int,
+        default=0,
+        help="If set, limit PyTorch CPU threads (recommended 1 when sharing a machine).",
+    )
 
     resnet = subparsers.add_parser("resnet", help="Train a simple ResNet-50 classifier")
     resnet.add_argument("--csv", required=True, help="Path to data.csv")
@@ -56,6 +74,18 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
+    if args.num_threads and args.num_threads > 0:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            torch = None
+        if torch is not None:
+            torch.set_num_threads(int(args.num_threads))
+            try:
+                torch.set_num_interop_threads(1)
+            except (AttributeError, RuntimeError):
+                pass
+
     pipeline = UnifiedGlassPipeline(
         PipelineConfig(
             csv_path=Path(args.csv),
@@ -69,10 +99,46 @@ def cmd_train(args: argparse.Namespace) -> int:
         )
     )
     resolved = pipeline.resolved_frame()
-    with_paths = resolved["image_path"].notna().sum() if "image_path" in resolved.columns else 0
+
+    # Optional deterministic subsampling to keep resource usage low.
+    frame = resolved
+    if args.max_patients and args.max_patients > 0:
+        # Prefer a label-stratified selection so small smoke runs cover multiple classes.
+        # Deterministic: within each label, patients are sorted by patient_id and then
+        # sampled round-robin across labels.
+        grouped = frame.groupby("patient_id", sort=True)["superclass"]
+        patient_to_label = grouped.agg(lambda s: str(s.mode().iloc[0]) if len(s.mode()) else str(s.iloc[0]))
+        by_label: dict[str, list[str]] = {}
+        for patient_id, label in patient_to_label.items():
+            by_label.setdefault(str(label), []).append(str(patient_id))
+        for label in by_label:
+            by_label[label] = sorted(by_label[label])
+
+        selected: list[str] = []
+        labels = sorted(by_label)
+        while len(selected) < int(args.max_patients):
+            progressed = False
+            for label in labels:
+                ids = by_label.get(label) or []
+                if not ids:
+                    continue
+                selected.append(ids.pop(0))
+                progressed = True
+                if len(selected) >= int(args.max_patients):
+                    break
+            if not progressed:
+                break
+
+        keep = set(selected)
+        frame = frame[frame["patient_id"].astype(str).isin(keep)].copy()
+    if args.max_images_per_patient and args.max_images_per_patient > 0:
+        k = int(args.max_images_per_patient)
+        frame = frame.groupby("patient_id", sort=True, group_keys=False).head(k).copy()
+
+    with_paths = frame["image_path"].notna().sum() if "image_path" in frame.columns else 0
     image_root = Path(args.image_root) if args.image_root else Path("data/images")
     splits = pipeline.patient_split_frames(
-        resolved,
+        frame,
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         seed=args.seed,
@@ -84,9 +150,9 @@ def cmd_train(args: argparse.Namespace) -> int:
     classifier_cfg = pipeline.quick_classifier_config() if args.quick else pipeline.classifier_config()
     print(
         {
-            "rows": len(resolved),
+            "rows": int(len(frame)),
             "image_paths_resolved": int(with_paths),
-            "clients": len(resolved.groupby("patient_id", sort=True)),
+            "clients": int(len(frame.groupby("patient_id", sort=True))),
             "split_rows": {
                 "train": int(len(train_frame)),
                 "val": int(len(val_frame)),

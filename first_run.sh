@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /opt/miniconda3/etc/profile.d/conda.sh
-conda activate bme_ml
+# Local developer convenience script.
+# Prefer the repo venv when present; otherwise fall back to system python.
+PYTHON="python"
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON=".venv/bin/python"
+fi
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
@@ -10,10 +14,10 @@ MODE="${1:-inspect}"
 
 case "$MODE" in
   inspect)
-    python -m code.cli inspect --csv data/data.csv
+    "${PYTHON}" -m code.cli inspect --csv data/data.csv
     ;;
   smoke)
-    python - <<'PY'
+    "${PYTHON}" - <<'PY'
 import torch
 from code.ssl import PathologyBackbone
 from code.graph import GraphClassifier
@@ -45,7 +49,7 @@ print("concept", logits.shape, concepts.shape, fused.shape)
 PY
     ;;
   train)
-    python -m code.cli train --csv data/data.csv --device auto
+    "${PYTHON}" -m code.cli train --csv data/data.csv --device auto
     ;;
   *)
     echo "Usage: $0 [inspect|smoke|train]" >&2

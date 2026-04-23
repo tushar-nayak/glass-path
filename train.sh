@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /opt/miniconda3/etc/profile.d/conda.sh
-conda activate bme_ml
+PYTHON="python"
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON=".venv/bin/python"
+fi
 
 export KMP_DUPLICATE_LIB_OK=TRUE
 
@@ -12,7 +14,7 @@ if [[ "${1:-}" != "" && "${1:-}" != -* ]]; then
   shift
 fi
 
-python -m code.cli train \
+"${PYTHON}" -m code.cli train \
   --csv data/data.csv \
   --image-root "${IMAGE_ROOT}" \
   --device auto \
