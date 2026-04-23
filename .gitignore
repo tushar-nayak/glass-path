@@ -12,5 +12,7 @@ build/
 *.pth
 checkpoints/
 train_cpu_*.log
-runs/
+# Keep large run artifacts out of git, but allow a small index README.
+runs/*
+!runs/README.md
 checkpoints_*/
