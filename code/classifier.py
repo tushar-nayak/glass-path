@@ -22,7 +22,7 @@ else:
     _TORCH_IMPORT_ERROR = None
 
 from .data import SampleRecord
-from .image import AugmentationConfig, augment_view, load_rgb_image
+from .image import AugmentationConfig, apply_normalization, augment_view, load_rgb_image
 from .federated import weighted_average_state_dicts
 from .ssl import PathologyBackbone, require_torch
 
@@ -37,12 +37,18 @@ class ClassificationMetrics:
 
 
 class SupervisedImageDataset(Dataset):
-    def __init__(self, records, label_to_index: dict[str, int], image_size: int = 224):
+    def __init__(
+        self,
+        records,
+        label_to_index: dict[str, int],
+        image_size: int = 224,
+        normalization: str = "instance",
+    ):
         require_torch()
         self.records = list(records)
         self.label_to_index = label_to_index
         self.image_size = image_size
-        self.aug = AugmentationConfig(image_size=image_size)
+        self.aug = AugmentationConfig(image_size=image_size, normalization=normalization)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -62,11 +68,18 @@ class SupervisedImageDataset(Dataset):
 
 
 class EvaluationImageDataset(Dataset):
-    def __init__(self, records, label_to_index: dict[str, int], image_size: int = 224):
+    def __init__(
+        self,
+        records,
+        label_to_index: dict[str, int],
+        image_size: int = 224,
+        normalization: str = "instance",
+    ):
         require_torch()
         self.records = list(records)
         self.label_to_index = label_to_index
         self.image_size = image_size
+        self.normalization = normalization
 
     def __len__(self) -> int:
         return len(self.records)
@@ -77,7 +90,10 @@ class EvaluationImageDataset(Dataset):
             raise ValueError(
                 "Encountered a record without an image_path. Resolve paths before training."
             )
-        image = load_rgb_image(record.image_path, image_size=self.image_size)
+        image = apply_normalization(
+            load_rgb_image(record.image_path, image_size=self.image_size),
+            self.normalization,
+        )
         view = torch.from_numpy(image).float()
         label = torch.tensor(self.label_to_index[record.label], dtype=torch.long)
         return view, label
@@ -115,6 +131,11 @@ class FederatedClassifierConfig:
     head_warmup_rounds: int = 1
     patience: int = 2
     min_delta: float = 1e-4
+    class_weighting: str = "none"  # "none" or "balanced"
+    client_fraction: float = 1.0
+    seed: int = 42
+    verbose: bool = False
+    normalization: str = "instance"
 
 
 def _confusion_matrix(y_true: list[int], y_pred: list[int], num_classes: int) -> list[list[int]]:
@@ -181,9 +202,15 @@ def evaluate_classifier(
     image_size: int = 224,
     batch_size: int = 16,
     device: str = "cpu",
+    normalization: str = "instance",
 ) -> ClassificationMetrics:
     require_torch()
-    dataset = EvaluationImageDataset(records, label_to_index=label_to_index, image_size=image_size)
+    dataset = EvaluationImageDataset(
+        records,
+        label_to_index=label_to_index,
+        image_size=image_size,
+        normalization=normalization,
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
     model = model.to(device)
     model.eval()
@@ -219,6 +246,7 @@ class FederatedClassifierTrainer:
             records,
             label_to_index=self.label_to_index,
             image_size=self.config.image_size,
+            normalization=self.config.normalization,
         )
         return DataLoader(
             dataset,
@@ -227,13 +255,29 @@ class FederatedClassifierTrainer:
             drop_last=False,
         )
 
-    def _train_local(self, model: PathologyClassifier, loader: DataLoader) -> dict:
+    def _clone_state_dict(self, model: PathologyClassifier) -> dict:
+        # Clone tensors so we can reuse a single model instance for multiple clients.
+        state = model.state_dict()
+        cloned = {}
+        for k, v in state.items():
+            if hasattr(v, "detach"):
+                cloned[k] = v.detach().to("cpu").clone()
+            else:
+                cloned[k] = v
+        return cloned
+
+    def _train_local(
+        self,
+        model: PathologyClassifier,
+        loader: DataLoader,
+        class_weights=None,
+    ) -> dict:
         model.to(self.config.device)
         model.train()
         optimizer = torch.optim.Adam(
             [p for p in model.parameters() if p.requires_grad], lr=self.config.lr
         )
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
         for _ in range(self.config.local_epochs):
             for view, label in loader:
                 view = view.to(self.config.device)
@@ -243,7 +287,7 @@ class FederatedClassifierTrainer:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-        return model.state_dict()
+        return self._clone_state_dict(model)
 
     def fit_rounds(
         self,
@@ -257,19 +301,29 @@ class FederatedClassifierTrainer:
             raise ValueError("No labeled images were found. Resolve paths before training.")
         total_rounds = self.config.rounds if rounds is None else rounds
         global_model = self._build_model(backbone, train_backbone=train_backbone).to(self.config.device)
-        for _ in range(total_rounds):
+        rng = np.random.default_rng(self.config.seed)
+        local_model = self._build_model(backbone, train_backbone=train_backbone).to(self.config.device)
+        for round_idx in range(total_rounds):
             local_states = []
             weights = []
-            for loader in loaders:
-                local_model = self._build_model(backbone, train_backbone=train_backbone).to(
-                    self.config.device
-                )
-                local_model.load_state_dict(global_model.state_dict())
+            num_clients = len(loaders)
+            take = num_clients
+            if self.config.client_fraction < 1.0:
+                take = max(1, int(round(num_clients * float(self.config.client_fraction))))
+            client_indices = list(range(num_clients))
+            if take < num_clients:
+                client_indices = rng.choice(client_indices, size=take, replace=False).tolist()
+            global_state = global_model.state_dict()
+            for idx in client_indices:
+                loader = loaders[idx]
+                local_model.load_state_dict(global_state)
                 local_model.set_backbone_trainable(train_backbone)
                 state = self._train_local(local_model, loader)
                 local_states.append(state)
                 weights.append(float(len(loader.dataset)))
             global_model.load_state_dict(weighted_average_state_dicts(local_states, weights))
+            if self.config.verbose:
+                print({"round": int(round_idx), "clients": int(len(weights))})
         return global_model.cpu()
 
     def _flatten_records(self, nested_records: Iterable[list]) -> list:
@@ -292,33 +346,68 @@ class FederatedClassifierTrainer:
         best_round = -1
         stale_rounds = 0
 
+        # Class weighting is computed globally (from the full train split) and applied to every client.
+        train_flat = self._flatten_records(train_records)
+        class_weights = None
+        if self.config.class_weighting.lower() == "balanced" and train_flat:
+            counts = [0 for _ in range(len(self.label_to_index))]
+            for record in train_flat:
+                counts[int(self.label_to_index[record.label])] += 1
+            # Inverse-frequency weights, normalized to mean 1.0
+            weights = []
+            for c in counts:
+                weights.append((len(train_flat) / max(1, c)))
+            mean_w = sum(weights) / len(weights)
+            weights = [w / mean_w for w in weights]
+            class_weights = torch.as_tensor(weights, dtype=torch.float32, device=self.config.device)
+
         global_model = self._build_model(backbone, train_backbone=False).to(self.config.device)
         max_rounds = self.config.rounds
+
+        rng = np.random.default_rng(self.config.seed)
+        local_model = self._build_model(backbone, train_backbone=False).to(self.config.device)
 
         for round_idx in range(max_rounds):
             train_backbone = round_idx >= self.config.head_warmup_rounds and not self.config.freeze_backbone
             local_states = []
             weights = []
-            for loader in train_loaders:
-                local_model = self._build_model(backbone, train_backbone=train_backbone).to(
-                    self.config.device
-                )
-                local_model.load_state_dict(global_model.state_dict())
-                local_model.set_backbone_trainable(train_backbone)
-                state = self._train_local(local_model, loader)
+            num_clients = len(train_loaders)
+            take = num_clients
+            if self.config.client_fraction < 1.0:
+                take = max(1, int(round(num_clients * float(self.config.client_fraction))))
+            client_indices = list(range(num_clients))
+            if take < num_clients:
+                client_indices = rng.choice(client_indices, size=take, replace=False).tolist()
+            global_state = global_model.state_dict()
+            local_model.set_backbone_trainable(train_backbone)
+            for idx in client_indices:
+                loader = train_loaders[idx]
+                local_model.load_state_dict(global_state)
+                state = self._train_local(local_model, loader, class_weights=class_weights)
                 local_states.append(state)
                 weights.append(float(len(loader.dataset)))
             global_model.load_state_dict(weighted_average_state_dicts(local_states, weights))
 
             val_metrics = evaluate_classifier(
                 global_model.cpu(),
-                val_flat,
-                self.label_to_index,
-                image_size=self.config.image_size,
-                batch_size=self.config.batch_size,
-                device="cpu",
-            )
+            val_flat,
+            self.label_to_index,
+            image_size=self.config.image_size,
+            batch_size=self.config.batch_size,
+            device="cpu",
+            normalization=self.config.normalization,
+        )
             score = val_metrics.macro_f1
+            if self.config.verbose:
+                print(
+                    {
+                        "round": int(round_idx),
+                        "clients": int(len(weights)),
+                        "val_macro_f1": float(val_metrics.macro_f1),
+                        "val_balanced_accuracy": float(val_metrics.balanced_accuracy),
+                        "val_accuracy": float(val_metrics.accuracy),
+                    }
+                )
             if score > best_score + self.config.min_delta:
                 best_score = score
                 best_model = copy.deepcopy(global_model.cpu())
@@ -340,6 +429,7 @@ class FederatedClassifierTrainer:
                 image_size=self.config.image_size,
                 batch_size=self.config.batch_size,
                 device="cpu",
+                normalization=self.config.normalization,
             )
             best_round = max_rounds - 1
 
@@ -372,6 +462,7 @@ class FederatedClassifierTrainer:
             image_size=self.config.image_size,
             batch_size=self.config.batch_size,
             device="cpu",
+            normalization=self.config.normalization,
         )
         return model, {
             "best_round": summary["best_round"],

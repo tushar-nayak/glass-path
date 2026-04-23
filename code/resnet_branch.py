@@ -23,7 +23,7 @@ else:
     _TORCH_IMPORT_ERROR = None
 
 from .data import SampleRecord
-from .image import AugmentationConfig, augment_view, load_rgb_image
+from .image import AugmentationConfig, apply_normalization, augment_view, load_rgb_image
 from .classifier import ClassificationMetrics, compute_classification_metrics, save_checkpoint
 from .runtime import resolve_device
 
@@ -36,13 +36,21 @@ def require_torch() -> None:
 
 
 class ResNetImageDataset(Dataset):
-    def __init__(self, records, label_to_index: dict[str, int], image_size: int = 224, augment: bool = True):
+    def __init__(
+        self,
+        records,
+        label_to_index: dict[str, int],
+        image_size: int = 224,
+        augment: bool = True,
+        normalization: str = "instance",
+    ):
         require_torch()
         self.records = list(records)
         self.label_to_index = label_to_index
         self.image_size = image_size
         self.augment = augment
-        self.aug = AugmentationConfig(image_size=image_size)
+        self.aug = AugmentationConfig(image_size=image_size, normalization=normalization)
+        self.normalization = normalization
 
     def __len__(self) -> int:
         return len(self.records)
@@ -55,6 +63,8 @@ class ResNetImageDataset(Dataset):
         if self.augment:
             rng = np.random.default_rng()
             image = augment_view(image, rng, self.aug)
+        else:
+            image = apply_normalization(image, self.normalization)
         view = torch.from_numpy(image).float()
         label = torch.tensor(self.label_to_index[record.label], dtype=torch.long)
         return view, label
@@ -98,12 +108,19 @@ def _flatten_records(nested_records: Iterable[list]) -> list[SampleRecord]:
     return [record for records in nested_records for record in records]
 
 
-def _make_loader(records, label_to_index: dict[str, int], image_size: int, augment: bool) -> DataLoader:
+def _make_loader(
+    records,
+    label_to_index: dict[str, int],
+    image_size: int,
+    augment: bool,
+    normalization: str,
+) -> DataLoader:
     dataset = ResNetImageDataset(
         records,
         label_to_index=label_to_index,
         image_size=image_size,
         augment=augment,
+        normalization=normalization,
     )
     return DataLoader(dataset, batch_size=min(16, len(dataset)) or 1, shuffle=augment, drop_last=False)
 
@@ -132,7 +149,8 @@ def train_resnet_branch(
     model.to_device(device)
     optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=config.lr)
     criterion = nn.CrossEntropyLoss()
-    train_loader = _make_loader(train_flat, label_to_index, config.image_size, augment=True)
+    normalization = "imagenet" if config.pretrained else "instance"
+    train_loader = _make_loader(train_flat, label_to_index, config.image_size, augment=True, normalization=normalization)
 
     best_state = copy.deepcopy({k: v.detach().clone() for k, v in model.state_dict().items()})
     best_score = float("-inf")
@@ -150,7 +168,9 @@ def train_resnet_branch(
             loss.backward()
             optimizer.step()
 
-        val_metrics = evaluate_resnet_branch(model, val_flat, label_to_index, config.image_size, device)
+        val_metrics = evaluate_resnet_branch(
+            model, val_flat, label_to_index, config.image_size, device, normalization=normalization
+        )
         score = val_metrics.macro_f1
         if score > best_score + config.min_delta:
             best_score = score
@@ -165,8 +185,12 @@ def train_resnet_branch(
     model.load_state_dict(best_state)
     model = model.to(device)
     model.to_device(device)
-    val_metrics = evaluate_resnet_branch(model, val_flat, label_to_index, config.image_size, device)
-    test_metrics = evaluate_resnet_branch(model, test_flat, label_to_index, config.image_size, device)
+    val_metrics = evaluate_resnet_branch(
+        model, val_flat, label_to_index, config.image_size, device, normalization=normalization
+    )
+    test_metrics = evaluate_resnet_branch(
+        model, test_flat, label_to_index, config.image_size, device, normalization=normalization
+    )
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -194,11 +218,12 @@ def evaluate_resnet_branch(
     label_to_index: dict[str, int],
     image_size: int = 224,
     device: str = "cpu",
+    normalization: str = "instance",
 ) -> ClassificationMetrics:
     require_torch()
     if not records:
         return compute_classification_metrics([], [], num_classes=len(label_to_index))
-    loader = _make_loader(records, label_to_index, image_size, augment=False)
+    loader = _make_loader(records, label_to_index, image_size, augment=False, normalization=normalization)
     model = model.to(device)
     model.to_device(device)
     model.eval()

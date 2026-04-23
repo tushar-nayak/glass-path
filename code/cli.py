@@ -7,6 +7,7 @@ from pathlib import Path
 from .pipeline import PipelineConfig, UnifiedGlassPipeline
 from .runtime import resolve_device
 from .classifier import save_checkpoint
+from .backbones import make_torchvision_backbone
 from .resnet_branch import ResNetBranchConfig, train_resnet_branch
 
 
@@ -62,6 +63,30 @@ def build_parser() -> argparse.ArgumentParser:
     resnet.add_argument("--freeze-backbone", action="store_true", help="Freeze all layers except fc")
     resnet.add_argument("--patience", type=int, default=2)
     resnet.add_argument("--save-dir", default="checkpoints_resnet", help="Directory for model checkpoints")
+
+    fedsup = subparsers.add_parser(
+        "fedsup",
+        help="Federated supervised training using a pretrained torchvision backbone (recommended baseline)",
+    )
+    fedsup.add_argument("--csv", required=True, help="Path to data.csv")
+    fedsup.add_argument("--image-root", default="data/images", help="Directory containing images")
+    fedsup.add_argument("--image-size", type=int, default=224)
+    fedsup.add_argument("--device", default="auto", help="auto, mps, cuda, or cpu")
+    fedsup.add_argument("--backbone", default="resnet50", help="torchvision backbone (resnet50)")
+    fedsup.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights")
+    fedsup.add_argument("--freeze-backbone", action="store_true", help="Freeze backbone and train head only")
+    fedsup.add_argument("--class-weighting", default="balanced", help="none or balanced")
+    fedsup.add_argument("--rounds", type=int, default=8)
+    fedsup.add_argument("--local-epochs", type=int, default=1)
+    fedsup.add_argument("--batch-size", type=int, default=16)
+    fedsup.add_argument("--lr", type=float, default=1e-4)
+    fedsup.add_argument("--client-fraction", type=float, default=0.3)
+    fedsup.add_argument("--verbose", action="store_true")
+    fedsup.add_argument("--num-threads", type=int, default=0)
+    fedsup.add_argument("--save-dir", default=None, help="Output directory (defaults under runs/)")
+    fedsup.add_argument("--val-fraction", type=float, default=0.15)
+    fedsup.add_argument("--test-fraction", type=float, default=0.15)
+    fedsup.add_argument("--seed", type=int, default=42)
 
     return parser
 
@@ -269,6 +294,93 @@ def cmd_resnet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fedsup(args: argparse.Namespace) -> int:
+    if args.num_threads and args.num_threads > 0:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            torch = None
+        if torch is not None:
+            torch.set_num_threads(int(args.num_threads))
+            try:
+                torch.set_num_interop_threads(1)
+            except (AttributeError, RuntimeError):
+                pass
+
+    pipeline = UnifiedGlassPipeline(
+        PipelineConfig(
+            csv_path=Path(args.csv),
+            image_root=Path(args.image_root),
+            image_size=args.image_size,
+            device=resolve_device(args.device),
+        )
+    )
+    resolved = pipeline.resolved_frame()
+    with_paths = resolved["image_path"].notna().sum() if "image_path" in resolved.columns else 0
+    if with_paths == 0:
+        print("No image files were resolved. Provide --image-root to run training.")
+        return 1
+
+    splits = pipeline.patient_split_frames(
+        resolved,
+        val_fraction=args.val_fraction,
+        test_fraction=args.test_fraction,
+        seed=args.seed,
+    )
+    train_records = pipeline.client_records_from_frame(splits["train"])
+    val_records = pipeline.client_records_from_frame(splits["val"])
+    test_records = pipeline.client_records_from_frame(splits["test"])
+    label_map = pipeline.label_map()
+
+    from .classifier import FederatedClassifierConfig, FederatedClassifierTrainer
+
+    backbone = make_torchvision_backbone(
+        name=args.backbone,
+        pretrained=bool(args.pretrained),
+        normalize=True,
+    )
+    config = FederatedClassifierConfig(
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        local_epochs=args.local_epochs,
+        rounds=args.rounds,
+        lr=args.lr,
+        device=resolve_device(args.device),
+        freeze_backbone=bool(args.freeze_backbone),
+        class_weighting=str(args.class_weighting),
+        client_fraction=float(args.client_fraction),
+        seed=int(args.seed),
+        verbose=bool(args.verbose),
+        normalization="imagenet" if bool(args.pretrained) else "instance",
+    )
+    trainer = FederatedClassifierTrainer(config, label_map)
+    model, metrics = trainer.train_and_evaluate(train_records, val_records, test_records, backbone)
+
+    # Default output location under runs/.
+    save_dir = Path(args.save_dir) if args.save_dir else Path("runs") / "fedsup_resnet50"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_checkpoint(
+        save_dir / "classifier.pt",
+        model,
+        metadata={
+            "branch": "fedsup",
+            "backbone": args.backbone,
+            "pretrained": bool(args.pretrained),
+            "freeze_backbone": bool(args.freeze_backbone),
+            "label_map": label_map,
+            "device": config.device,
+        },
+    )
+    metrics_payload = {
+        "best_round": int(metrics["best_round"]),
+        "val": metrics["val"].__dict__,
+        "test": metrics["test"].__dict__,
+    }
+    (save_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
+    print({"save_dir": str(save_dir), "metrics": metrics_payload})
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -278,6 +390,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train(args)
     if args.command == "resnet":
         return cmd_resnet(args)
+    if args.command == "fedsup":
+        return cmd_fedsup(args)
     raise ValueError(f"Unknown command: {args.command}")
 
 

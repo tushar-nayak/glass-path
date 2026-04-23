@@ -13,6 +13,7 @@ class AugmentationConfig:
     jitter: float = 0.12
     blur_prob: float = 0.2
     flip_prob: float = 0.5
+    normalization: str = "instance"  # "instance" or "imagenet"
 
 
 def load_rgb_image(path: str | Path, image_size: int = 224) -> np.ndarray:
@@ -40,6 +41,24 @@ def normalize_image(image: np.ndarray) -> np.ndarray:
     mean = image.mean(axis=(-2, -1), keepdims=True)
     std = image.std(axis=(-2, -1), keepdims=True) + 1e-6
     return (image - mean) / std
+
+
+_IMAGENET_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+_IMAGENET_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+
+
+def normalize_imagenet(image: np.ndarray) -> np.ndarray:
+    image = image.astype(np.float32)
+    return (image - _IMAGENET_MEAN) / (_IMAGENET_STD + 1e-6)
+
+
+def apply_normalization(image: np.ndarray, mode: str) -> np.ndarray:
+    mode = (mode or "instance").lower().strip()
+    if mode == "instance":
+        return normalize_image(image)
+    if mode == "imagenet":
+        return normalize_imagenet(image)
+    raise ValueError(f"Unknown normalization mode: {mode!r}")
 
 
 def random_flip(image: np.ndarray, rng: np.random.Generator, prob: float = 0.5) -> np.ndarray:
@@ -84,7 +103,7 @@ def augment_view(image: np.ndarray, rng: np.random.Generator, cfg: AugmentationC
     out = random_blur(out, rng, prob=cfg.blur_prob)
     crop_size = max(32, int(cfg.image_size * rng.uniform(0.7, 1.0)))
     out = random_crop(out, rng, crop_size=crop_size)
-    return normalize_image(out)
+    return apply_normalization(out, cfg.normalization)
 
 
 def feature_vector(image: np.ndarray, bins: int = 16) -> np.ndarray:
@@ -103,4 +122,3 @@ def feature_vector(image: np.ndarray, bins: int = 16) -> np.ndarray:
         dtype=np.float32,
     )
     return np.concatenate([hist.astype(np.float32), stats], axis=0)
-
