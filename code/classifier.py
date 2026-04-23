@@ -136,6 +136,7 @@ class FederatedClassifierConfig:
     seed: int = 42
     verbose: bool = False
     normalization: str = "instance"
+    prox_mu: float = 0.0
 
 
 def _confusion_matrix(y_true: list[int], y_pred: list[int], num_classes: int) -> list[list[int]]:
@@ -271,6 +272,7 @@ class FederatedClassifierTrainer:
         model: PathologyClassifier,
         loader: DataLoader,
         class_weights=None,
+        global_state: dict | None = None,
     ) -> dict:
         model.to(self.config.device)
         model.train()
@@ -284,6 +286,14 @@ class FederatedClassifierTrainer:
                 label = label.to(self.config.device)
                 logits = model(view)
                 loss = criterion(logits, label)
+                if global_state is not None and self.config.prox_mu > 0:
+                    prox = torch.zeros((), device=self.config.device)
+                    for name, param in model.named_parameters():
+                        if not param.requires_grad:
+                            continue
+                        ref = global_state[name].to(self.config.device)
+                        prox = prox + torch.sum((param - ref) ** 2)
+                    loss = loss + 0.5 * self.config.prox_mu * prox
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -383,7 +393,12 @@ class FederatedClassifierTrainer:
             for idx in client_indices:
                 loader = train_loaders[idx]
                 local_model.load_state_dict(global_state)
-                state = self._train_local(local_model, loader, class_weights=class_weights)
+                state = self._train_local(
+                    local_model,
+                    loader,
+                    class_weights=class_weights,
+                    global_state=global_state,
+                )
                 local_states.append(state)
                 weights.append(float(len(loader.dataset)))
             global_model.load_state_dict(weighted_average_state_dicts(local_states, weights))

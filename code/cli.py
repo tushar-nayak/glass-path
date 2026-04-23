@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     fedsup.add_argument("--batch-size", type=int, default=16)
     fedsup.add_argument("--lr", type=float, default=1e-4)
     fedsup.add_argument("--client-fraction", type=float, default=0.3)
+    fedsup.add_argument("--prox-mu", type=float, default=0.01)
     fedsup.add_argument("--verbose", action="store_true")
     fedsup.add_argument("--num-threads", type=int, default=0)
     fedsup.add_argument("--save-dir", default=None, help="Output directory (defaults under runs/)")
@@ -352,6 +353,7 @@ def cmd_fedsup(args: argparse.Namespace) -> int:
         seed=int(args.seed),
         verbose=bool(args.verbose),
         normalization="imagenet" if bool(args.pretrained) else "instance",
+        prox_mu=float(args.prox_mu),
     )
     trainer = FederatedClassifierTrainer(config, label_map)
     model, metrics = trainer.train_and_evaluate(train_records, val_records, test_records, backbone)
