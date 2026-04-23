@@ -11,12 +11,13 @@ import numpy as np
 try:
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
     torch = None
     nn = None
     DataLoader = None
     Dataset = object
+    WeightedRandomSampler = None
     _TORCH_IMPORT_ERROR = exc
 else:
     _TORCH_IMPORT_ERROR = None
@@ -137,6 +138,7 @@ class FederatedClassifierConfig:
     verbose: bool = False
     normalization: str = "instance"
     prox_mu: float = 0.0
+    client_sampling: str = "shuffle"  # "shuffle" or "balanced"
 
 
 def _confusion_matrix(y_true: list[int], y_pred: list[int], num_classes: int) -> list[list[int]]:
@@ -249,6 +251,27 @@ class FederatedClassifierTrainer:
             image_size=self.config.image_size,
             normalization=self.config.normalization,
         )
+        sampling = self.config.client_sampling.lower().strip()
+        if sampling == "balanced":
+            if WeightedRandomSampler is None:  # pragma: no cover - dependency guard
+                raise ModuleNotFoundError("WeightedRandomSampler requires PyTorch to be installed")
+            labels = [self.label_to_index[record.label] for record in dataset.records]
+            class_counts = np.bincount(labels, minlength=len(self.label_to_index)).astype(np.float32)
+            sample_weights = np.asarray(
+                [1.0 / max(class_counts[label], 1.0) for label in labels], dtype=np.float32
+            )
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(sample_weights, dtype=torch.float32),
+                num_samples=len(dataset),
+                replacement=True,
+            )
+            return DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                sampler=sampler,
+                shuffle=False,
+                drop_last=False,
+            )
         return DataLoader(
             dataset,
             batch_size=self.config.batch_size,
