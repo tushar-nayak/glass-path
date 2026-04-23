@@ -9,6 +9,7 @@ from .runtime import resolve_device
 from .classifier import save_checkpoint
 from .backbones import make_torchvision_backbone
 from .resnet_branch import ResNetBranchConfig, train_resnet_branch
+from .hybrid import HybridBranchConfig, train_hybrid_branch
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,6 +90,40 @@ def build_parser() -> argparse.ArgumentParser:
     fedsup.add_argument("--val-fraction", type=float, default=0.15)
     fedsup.add_argument("--test-fraction", type=float, default=0.15)
     fedsup.add_argument("--seed", type=int, default=42)
+
+    hybrid = subparsers.add_parser(
+        "hybrid",
+        help="Train a pretrained patch-graph hybrid (CNN patches + graph pooling)",
+    )
+    hybrid.add_argument("--csv", required=True, help="Path to data.csv")
+    hybrid.add_argument("--image-root", default="data/images", help="Directory containing images")
+    hybrid.add_argument("--image-size", type=int, default=224)
+    hybrid.add_argument("--patch-grid", type=int, default=2)
+    hybrid.add_argument("--device", default="auto", help="auto, mps, cuda, or cpu")
+    hybrid.add_argument("--pretrained", action="store_true", help="Use torchvision pretrained weights")
+    hybrid.add_argument("--freeze-patch-encoder", action="store_true", help="Freeze the patch encoder")
+    hybrid.add_argument("--epochs", type=int, default=4)
+    hybrid.add_argument("--batch-size", type=int, default=8)
+    hybrid.add_argument("--lr", type=float, default=1e-4)
+    hybrid.add_argument("--patience", type=int, default=2)
+    hybrid.add_argument("--min-delta", type=float, default=1e-4)
+    hybrid.add_argument("--num-threads", type=int, default=0)
+    hybrid.add_argument("--save-dir", default=None, help="Output directory (defaults under runs/)")
+    hybrid.add_argument("--val-fraction", type=float, default=0.15)
+    hybrid.add_argument("--test-fraction", type=float, default=0.15)
+    hybrid.add_argument("--seed", type=int, default=42)
+    hybrid.add_argument(
+        "--max-patients",
+        type=int,
+        default=0,
+        help="If set, only use the first N patients (sorted by patient_id) to reduce runtime.",
+    )
+    hybrid.add_argument(
+        "--max-images-per-patient",
+        type=int,
+        default=0,
+        help="If set, cap the number of images used per patient to reduce runtime.",
+    )
 
     return parser
 
@@ -385,6 +420,113 @@ def cmd_fedsup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_hybrid(args: argparse.Namespace) -> int:
+    if args.num_threads and args.num_threads > 0:
+        try:
+            import torch
+        except ModuleNotFoundError:
+            torch = None
+        if torch is not None:
+            torch.set_num_threads(int(args.num_threads))
+            try:
+                torch.set_num_interop_threads(1)
+            except (AttributeError, RuntimeError):
+                pass
+
+    pipeline = UnifiedGlassPipeline(
+        PipelineConfig(
+            csv_path=Path(args.csv),
+            image_root=Path(args.image_root),
+            image_size=args.image_size,
+            device=resolve_device(args.device),
+        )
+    )
+    resolved = pipeline.resolved_frame()
+    frame = resolved
+    if args.max_patients and args.max_patients > 0:
+        grouped = frame.groupby("patient_id", sort=True)["superclass"]
+        patient_to_label = grouped.agg(lambda s: str(s.mode().iloc[0]) if len(s.mode()) else str(s.iloc[0]))
+        by_label: dict[str, list[str]] = {}
+        for patient_id, label in patient_to_label.items():
+            by_label.setdefault(str(label), []).append(str(patient_id))
+        for label in by_label:
+            by_label[label] = sorted(by_label[label])
+        selected: list[str] = []
+        labels = sorted(by_label)
+        while len(selected) < int(args.max_patients):
+            progressed = False
+            for label in labels:
+                ids = by_label.get(label) or []
+                if not ids:
+                    continue
+                selected.append(ids.pop(0))
+                progressed = True
+                if len(selected) >= int(args.max_patients):
+                    break
+            if not progressed:
+                break
+        frame = frame[frame["patient_id"].astype(str).isin(set(selected))].copy()
+    if args.max_images_per_patient and args.max_images_per_patient > 0:
+        frame = frame.groupby("patient_id", sort=True, group_keys=False).head(int(args.max_images_per_patient)).copy()
+
+    with_paths = frame["image_path"].notna().sum() if "image_path" in frame.columns else 0
+    if with_paths == 0:
+        print("No image files were resolved. Provide --image-root to run training.")
+        return 1
+
+    splits = pipeline.patient_split_frames(
+        frame,
+        val_fraction=args.val_fraction,
+        test_fraction=args.test_fraction,
+        seed=args.seed,
+    )
+    train_records = pipeline.client_records_from_frame(splits["train"])
+    val_records = pipeline.client_records_from_frame(splits["val"])
+    test_records = pipeline.client_records_from_frame(splits["test"])
+    label_map = pipeline.label_map()
+
+    config = HybridBranchConfig(
+        image_size=args.image_size,
+        patch_grid=args.patch_grid,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        device=resolve_device(args.device),
+        pretrained=bool(args.pretrained),
+        freeze_patch_encoder=bool(args.freeze_patch_encoder),
+        patience=args.patience,
+        min_delta=args.min_delta,
+    )
+    model, metrics = train_hybrid_branch(
+        train_records,
+        val_records,
+        test_records,
+        label_map,
+        config,
+        save_dir=Path(args.save_dir) if args.save_dir else Path("runs") / "hybrid_patch_graph",
+    )
+    metrics_payload = {
+        "best_round": int(metrics["best_round"]),
+        "val": metrics["val"].__dict__,
+        "test": metrics["test"].__dict__,
+    }
+    save_dir = Path(args.save_dir) if args.save_dir else Path("runs") / "hybrid_patch_graph"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / "metrics.json").write_text(json.dumps(metrics_payload, indent=2))
+    print(
+        {
+            "model": type(model).__name__,
+            "device": config.device,
+            "label_map": label_map,
+            "metrics": {
+                **metrics_payload,
+            },
+            "save_dir": str(save_dir),
+        }
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -396,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_resnet(args)
     if args.command == "fedsup":
         return cmd_fedsup(args)
+    if args.command == "hybrid":
+        return cmd_hybrid(args)
     raise ValueError(f"Unknown command: {args.command}")
 
 
